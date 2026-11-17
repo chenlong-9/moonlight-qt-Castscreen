@@ -7,3 +7,17 @@ build/
 libs/
 config.tests/*/.qmake.stash
 config.tests/*/Makefile
+
+# Castscreen local outputs and private runtime state
+/artifacts/
+/releases/
+*.log
+*.identity.json
+*.pfx
+*.p12
+*.key
+.env
+/config/
+receiver.conf
+sunshine_state.json
+enterprise-authorized-clients.json

@@ -100,6 +100,90 @@ Flickable {
         spacing: 15
 
         GroupBox {
+            id: receiverSettingsGroup
+            visible: ReceiverSettings !== null
+            width: parent.width - parent.leftPadding - parent.rightPadding
+            padding: 12
+            title: "<font color=\"skyblue\">" + qsTr("会议室接收端") + "</font>"
+            font.pointSize: 12
+
+            Column {
+                width: parent.width
+                spacing: 8
+
+                Label {
+                    text: qsTr("会议室名称")
+                    font.pointSize: 12
+                }
+                TextField {
+                    id: roomNameField
+                    objectName: "receiverRoomName"
+                    width: parent.width
+                    maximumLength: 32
+                    // Keep an editing draft independent of the shared status notifier.
+                    Component.onCompleted: text = ReceiverSettings ? ReceiverSettings.roomName : ""
+                    placeholderText: qsTr("例如：三楼会议室")
+                    selectByMouse: true
+                    onAccepted: saveRoomNameButton.clicked()
+                }
+                Button {
+                    id: saveRoomNameButton
+                    objectName: "saveReceiverRoomName"
+                    text: qsTr("保存会议室名称")
+                    enabled: roomNameField.text.trim().length > 0
+                    onClicked: {
+                        if (ReceiverSettings.saveRoomName(roomNameField.text))
+                            roomNameField.text = ReceiverSettings.roomName
+                    }
+                }
+                Label {
+                    width: parent.width
+                    text: qsTr("接收状态：") + (ReceiverSettings ? ReceiverSettings.receiverStatus : "")
+                    wrapMode: Text.Wrap
+                }
+                Label {
+                    width: parent.width
+                    text: qsTr("名称保存后立即用于员工端的大屏发现列表。")
+                    font.pointSize: 9
+                    wrapMode: Text.Wrap
+                }
+                Label {
+                    width: parent.width
+                    text: qsTr("防火墙：") + (ReceiverSettings ? ReceiverSettings.firewallStatus : "")
+                    wrapMode: Text.Wrap
+                }
+                Flow {
+                    width: parent.width
+                    spacing: 8
+                    Button {
+                        text: qsTr("重新检查")
+                        onClicked: ReceiverSettings.refreshFirewallStatus()
+                    }
+                    Button {
+                        text: qsTr("放行防火墙…")
+                        onClicked: ReceiverSettings.allowFirewall()
+                    }
+                }
+                Label {
+                    width: parent.width
+                    text: ReceiverSettings ? ReceiverSettings.settingsMessage : ""
+                    visible: text.length > 0
+                    wrapMode: Text.Wrap
+                    font.pointSize: 9
+                }
+                Label {
+                    width: parent.width
+                    text: qsTr("仅修改防火墙规则时需要管理员确认。规则检查不保证网络端到端可达。")
+                    font.pointSize: 9
+                    wrapMode: Text.Wrap
+                }
+            }
+            Component.onCompleted: {
+                if (ReceiverSettings) ReceiverSettings.refreshFirewallStatus()
+            }
+        }
+
+        GroupBox {
             id: basicSettingsGroupBox
             width: (parent.width - (parent.leftPadding + parent.rightPadding))
             padding: 12

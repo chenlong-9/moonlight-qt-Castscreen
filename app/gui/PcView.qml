@@ -244,9 +244,13 @@ CenteredGridView {
                     // Kick off pairing in the background
                     computerModel.pairComputer(index, pin)
 
-                    // Display the pairing dialog
-                    pairDialog.pin = pin
-                    pairDialog.open()
+                    // Enterprise pinless pairing derives the PIN for both ends, so there
+                    // is nothing for the operator to type on the host machine.
+                    if (!StreamingPreferences.enterprisePinlessPairing) {
+                        // Display the pairing dialog
+                        pairDialog.pin = pin
+                        pairDialog.open()
+                    }
                 }
             } else if (!model.online) {
                 // Using open() here because it may be activated by keyboard

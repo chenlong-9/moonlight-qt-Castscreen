@@ -225,6 +225,14 @@ ApplicationWindow {
         SdlGamepadKeyNavigation.notifyWindowFocus(visible && active)
     }
 
+    function openReceiverSettings() {
+        window.show()
+        window.raise()
+        window.requestActivate()
+        navigateTo("qrc:/gui/SettingsView.qml", SettingsView)
+        stackView.currentItem.contentY = 0
+    }
+
     function navigateTo(url, objectType)
     {
         var existingItem = stackView.find(function(item, index) {

@@ -52,8 +52,20 @@
 #define SER_KEEPAWAKE "keepawake"
 #define SER_LANGUAGE "language"
 #define SER_RENDERER "renderer"
+#define SER_ENTERPRISEPINLESS "enterprisepinless"
 
 #define CURRENT_DEFAULT_VER 2
+
+// Defaults for a fresh install (no stored settings yet): 1080p60 at the
+// resolution-appropriate default bitrate (20 Mbps for 1080p60), fullscreen.
+// The standby receiver launches its streaming child with
+// "--1080 --fps 60 --bitrate 20000 --display-mode fullscreen", so these
+// defaults must stay in sync with that argument list.
+// Existing installations keep whatever they saved in QSettings; changing these
+// values must never override a user's own settings.
+static constexpr int kDefaultStreamWidth = 1920;
+static constexpr int kDefaultStreamHeight = 1080;
+static constexpr int kDefaultStreamFps = 60;
 
 static StreamingPreferences* s_GlobalPrefs;
 
@@ -122,9 +134,9 @@ void StreamingPreferences::reload()
     }
 #endif
 
-    width = settings.value(SER_WIDTH, 1920).toInt();
-    height = settings.value(SER_HEIGHT, 1080).toInt();
-    fps = settings.value(SER_FPS, 60).toInt();
+    width = settings.value(SER_WIDTH, kDefaultStreamWidth).toInt();
+    height = settings.value(SER_HEIGHT, kDefaultStreamHeight).toInt();
+    fps = settings.value(SER_FPS, kDefaultStreamFps).toInt();
     enableYUV444 = settings.value(SER_YUV444, false).toBool();
     bitrateKbps = settings.value(SER_BITRATE, getDefaultBitrate(width, height, fps, enableYUV444)).toInt();
     unlockBitrate = settings.value(SER_UNLOCK_BITRATE, false).toBool();
@@ -151,6 +163,7 @@ void StreamingPreferences::reload()
     reverseScrollDirection = settings.value(SER_REVERSESCROLL, false).toBool();
     swapFaceButtons = settings.value(SER_SWAPFACEBUTTONS, false).toBool();
     keepAwake = settings.value(SER_KEEPAWAKE, true).toBool();
+    enterprisePinlessPairing = settings.value(SER_ENTERPRISEPINLESS, true).toBool();
     enableHdr = settings.value(SER_HDR, false).toBool();
     captureSysKeysMode = static_cast<CaptureSysKeysMode>(settings.value(SER_CAPTURESYSKEYS,
                                                          static_cast<int>(CaptureSysKeysMode::CSK_OFF)).toInt());
@@ -362,6 +375,7 @@ void StreamingPreferences::save()
     settings.setValue(SER_SWAPFACEBUTTONS, swapFaceButtons);
     settings.setValue(SER_CAPTURESYSKEYS, captureSysKeysMode);
     settings.setValue(SER_KEEPAWAKE, keepAwake);
+    settings.setValue(SER_ENTERPRISEPINLESS, enterprisePinlessPairing);
 }
 
 int StreamingPreferences::getDefaultBitrate(int width, int height, int fps, bool yuv444)

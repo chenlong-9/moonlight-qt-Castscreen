@@ -50,7 +50,11 @@ win32 {
     }
 
     INCLUDEPATH += $$PWD/../libs/windows/include
-    LIBS += ws2_32.lib winmm.lib dxva2.lib ole32.lib gdi32.lib user32.lib d3d9.lib dwmapi.lib dbghelp.lib
+    # advapi32: OpenProcessToken/GetTokenInformation/GetSidSubAuthority* for the
+    # mandatory-integrity-level check in receiverservice.cpp.
+    # oleaut32: BSTR helpers (SysAllocString/SysFreeString) used by the
+    # firewall rule code in receiverservice.cpp.
+    LIBS += ws2_32.lib winmm.lib dxva2.lib ole32.lib oleaut32.lib gdi32.lib user32.lib d3d9.lib dwmapi.lib dbghelp.lib advapi32.lib
 }
 macx:!disable-prebuilts {
     !exists($$PWD/../libs/mac) {
@@ -176,6 +180,8 @@ SOURCES += \
     backend/nvhttp.cpp \
     backend/nvpairingmanager.cpp \
     backend/computermanager.cpp \
+    backend/enterprisepairing.cpp \
+    backend/receiverservice.cpp \
     backend/boxartmanager.cpp \
     backend/richpresencemanager.cpp \
     cli/commandlineparser.cpp \
@@ -220,6 +226,8 @@ HEADERS += \
     backend/nvhttp.h \
     backend/nvpairingmanager.h \
     backend/computermanager.h \
+    backend/enterprisepairing.h \
+    backend/receiverservice.h \
     backend/boxartmanager.h \
     backend/richpresencemanager.h \
     cli/commandlineparser.h \
@@ -551,7 +559,9 @@ win32 {
     QMAKE_TARGET_PRODUCT = Moonlight
 
     CONFIG -= embed_manifest_exe
-    QMAKE_LFLAGS += /MANIFEST:embed /MANIFESTINPUT:$${PWD}/Moonlight.exe.manifest
+    # Quote the manifest path: the build tree path may contain spaces, and an
+    # unquoted /MANIFESTINPUT:... is split by the linker (LNK1181).
+    QMAKE_LFLAGS += /MANIFEST:embed /MANIFESTINPUT:\"$${PWD}/Moonlight.exe.manifest\"
 }
 macx {
     # Create Info.plist in object dir with the correct version string

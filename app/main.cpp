@@ -50,6 +50,7 @@
 #include "gui/appmodel.h"
 #include "backend/autoupdatechecker.h"
 #include "backend/computermanager.h"
+#include "backend/receiverservice.h"
 #include "backend/systemproperties.h"
 #include "streaming/session.h"
 #include "settings/streamingpreferences.h"
@@ -422,8 +423,85 @@ void configureSignalHandlers()
 
 #endif
 
+// Standby mode is a headless receiver daemon: no GUI, no QML. It must be
+// detected before any GUI/QML object is created, so keep this free of Qt
+// object construction.
+static bool hasStandbyArgument(int argc, char* argv[])
+{
+    for (int i = 1; i < argc; i++) {
+        if (QString::fromLocal8Bit(argv[i]).compare(QStringLiteral("standby"),
+                                                    Qt::CaseInsensitive) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// Matches one exact receiver-only switch ("--ui", "--show-settings", ...).
+static bool hasReceiverOptionArgument(int argc, char* argv[], const char* option)
+{
+    const QString optionString = QString::fromLatin1(option);
+    for (int i = 1; i < argc; i++) {
+        if (QString::fromLocal8Bit(argv[i]).compare(optionString, Qt::CaseInsensitive) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// Strips the receiver-only switches from the command line that is handed to
+// the regular command line parser. Without this, "standby --ui" would be
+// parsed as an unknown action and exit with an error.
+static QStringList receiverFilteredArguments(int argc, char* argv[])
+{
+    QStringList args;
+    for (int i = 0; i < argc; i++) {
+        const QString arg = QString::fromLocal8Bit(argv[i]);
+        if (i > 0 &&
+                (arg.compare(QStringLiteral("standby"), Qt::CaseInsensitive) == 0 ||
+                 arg.compare(QStringLiteral("--ui"), Qt::CaseInsensitive) == 0 ||
+                 arg.compare(QStringLiteral("--show-settings"), Qt::CaseInsensitive) == 0)) {
+            continue;
+        }
+        args.append(arg);
+    }
+    return args;
+}
+
 int main(int argc, char *argv[])
 {
+    // --fix-firewall is executed by the elevated helper process that the
+    // receiver settings dialog starts via ShellExecuteW("runas"). Handle it
+    // before anything else so that no GUI, tray icon, listener, or QML is
+    // created in the helper. The exit code tells the caller whether the
+    // firewall rules were installed.
+    for (int i = 1; i < argc; i++) {
+        if (qstrcmp(argv[i], "--fix-firewall") != 0) {
+            continue;
+        }
+
+        if (i + 2 >= argc) {
+            fprintf(stderr, "usage: Moonlight.exe --fix-firewall <control-port> <discovery-port>\n");
+            return 1;
+        }
+
+        bool controlPortOk = false;
+        bool discoveryPortOk = false;
+        const uint controlPort = QString::fromLocal8Bit(argv[i + 1]).toUInt(&controlPortOk);
+        const uint discoveryPort = QString::fromLocal8Bit(argv[i + 2]).toUInt(&discoveryPortOk);
+        if (!controlPortOk || !discoveryPortOk ||
+                controlPort < 1 || controlPort > 65535 ||
+                discoveryPort < 1 || discoveryPort > 65535) {
+            fprintf(stderr, "usage: Moonlight.exe --fix-firewall <control-port> <discovery-port>\n");
+            return 1;
+        }
+
+        // The helper needs a Qt application to resolve its executable path.
+        // No GUI or receiver listener is created here.
+        QCoreApplication helperApplication(argc, argv);
+        return ReceiverService::fixFirewall(quint16(controlPort), quint16(discoveryPort)) ? 0 : 1;
+    }
+
     SDL_SetMainReady();
 
     // Set the app version for the QCommandLineParser's showVersion() command
@@ -447,6 +525,26 @@ int main(int argc, char *argv[])
     else {
         // Initialize paths for standard installation
         Path::initialize(false);
+    }
+
+    const bool standbyRequested = hasStandbyArgument(argc, argv);
+    const bool showReceiverSettings = hasReceiverOptionArgument(argc, argv, "--show-settings");
+    const bool uiRequested = hasReceiverOptionArgument(argc, argv, "--ui") || showReceiverSettings;
+
+    // Headless standby mode: wait for a sender request and stream to it.
+    // This is handled before any QGuiApplication/QQmlApplicationEngine is
+    // created, so no window, tray icon, or QML is ever initialized. With
+    // --ui we deliberately fall through to the regular GUI path and start
+    // the receiver service after the QML window has been created.
+    if (standbyRequested && !uiRequested) {
+        QCoreApplication coreApp(argc, argv);
+
+        ReceiverService service;
+        if (!service.start()) {
+            return 1;
+        }
+
+        return coreApp.exec();
     }
 
     // Override the default QML cache directory with the one we chose
@@ -817,7 +915,7 @@ int main(int argc, char *argv[])
 #endif
 
     GlobalCommandLineParser parser;
-    GlobalCommandLineParser::ParseResult commandLineParserResult = parser.parse(app.arguments());
+    GlobalCommandLineParser::ParseResult commandLineParserResult = parser.parse(receiverFilteredArguments(argc, argv));
     switch (commandLineParserResult) {
     case GlobalCommandLineParser::ListRequested:
         // Don't log to the console since it will jumble the command output
@@ -1045,6 +1143,15 @@ int main(int argc, char *argv[])
         }
     }
 
+    ReceiverService* receiverSettings = nullptr;
+    if ((standbyRequested && uiRequested) ||
+            commandLineParserResult == GlobalCommandLineParser::NormalStartRequested) {
+        auto* manager = engine.singletonInstance<ComputerManager*>(
+            "ComputerManager", "ComputerManager");
+        receiverSettings = new ReceiverService(&app, manager);
+    }
+    engine.rootContext()->setContextProperty("ReceiverSettings", receiverSettings);
+
     if (hasGUI) {
         engine.rootContext()->setContextProperty("initialView", initialView);
         engine.rootContext()->setContextProperty("isGuiLaunch", commandLineParserResult == GlobalCommandLineParser::NormalStartRequested);
@@ -1053,6 +1160,32 @@ int main(int argc, char *argv[])
         engine.load(QUrl(QStringLiteral("qrc:/gui/main.qml")));
         if (engine.rootObjects().isEmpty())
             return -1;
+    }
+
+    // standby --ui: the QML window and Settings page are up, so now bring up
+    // the receiver service in this same process (listener, discovery, tray).
+    // A second instance cannot bind the ports; in that case ask the running
+    // instance to raise its window and exit without a crash.
+    if ((standbyRequested && uiRequested) ||
+            commandLineParserResult == GlobalCommandLineParser::NormalStartRequested) {
+        // Share QML's host registry: independent managers would overwrite each
+        // other's deletions and newly paired certificates in QSettings.
+        ReceiverService* service = receiverSettings;
+        QObject::connect(service, &ReceiverService::openNativeSettingsRequested,
+                         engine.rootObjects().first(), [root = engine.rootObjects().first()] {
+            QMetaObject::invokeMethod(root, "openReceiverSettings");
+        });
+        if (!service->start()) {
+            qWarning() << "Another standby receiver instance owns the ports; asking it for its window";
+            ReceiverService::requestExistingInstanceWindow();
+            return 1;
+        }
+
+        QObject::connect(&app, &QCoreApplication::aboutToQuit, service, &ReceiverService::stop);
+        if (showReceiverSettings) {
+            QMetaObject::invokeMethod(engine.rootObjects().first(), "openReceiverSettings",
+                                      Qt::QueuedConnection);
+        }
     }
 
     int err = app.exec();

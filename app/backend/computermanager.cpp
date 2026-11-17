@@ -1,5 +1,6 @@
 #include "computermanager.h"
 #include "boxartmanager.h"
+#include "enterprisepairing.h"
 #include "nvhttp.h"
 #include "nvpairingmanager.h"
 
@@ -9,7 +10,11 @@
 #include <QThread>
 #include <QThreadPool>
 #include <QCoreApplication>
+#include <QElapsedTimer>
 #include <QRandomGenerator>
+#include <QDateTime>
+#include <QDir>
+#include <QFile>
 
 #define SER_HOSTS "hosts"
 #define SER_HOSTS_BACKUP "hostsbackup"
@@ -163,7 +168,9 @@ ComputerManager::ComputerManager(StreamingPreferences* prefs)
       m_PollingRef(0),
       m_MdnsBrowser(nullptr),
       m_CompatFetcher(nullptr),
-      m_NeedsDelayedFlush(false)
+      m_NeedsDelayedFlush(false),
+      m_DelayedFlushRequested(0),
+      m_DelayedFlushed(0)
 {
     QSettings settings;
 
@@ -252,6 +259,8 @@ ComputerManager::~ComputerManager()
 
 void DelayedFlushThread::run() {
     for (;;) {
+        quint64 flushGeneration = 0;
+
         // Wait for a delayed flush request or an interruption
         {
             QMutexLocker locker(&m_ComputerManager->m_DelayedFlushMutex);
@@ -270,8 +279,13 @@ void DelayedFlushThread::run() {
             // Reset the delayed flush flag to ensure any racing saveHosts() call will set it again
             m_ComputerManager->m_NeedsDelayedFlush = false;
 
+            // Capture the generation of changes this flush covers. Any request
+            // queued after this point is picked up by the next loop iteration.
+            flushGeneration = m_ComputerManager->m_DelayedFlushRequested;
+
             // Update the last serialized hosts map under the delayed flush mutex
             m_ComputerManager->m_LastSerializedHosts.clear();
+            QReadLocker hostsLock(&m_ComputerManager->m_Lock);
             for (const NvComputer* computer : std::as_const(m_ComputerManager->m_KnownHosts)) {
                 // Copy the current state of the NvComputer to allow us to check later if we need
                 // to serialize it again when attribute updates occur.
@@ -280,7 +294,9 @@ void DelayedFlushThread::run() {
             }
         }
 
-        // Perform the flush
+        // Perform the flush. QSettings may defer writes until sync/destruction,
+        // so capture its status only after explicitly committing pending changes.
+        QSettings::Status flushStatus;
         {
             QSettings settings;
 
@@ -311,6 +327,30 @@ void DelayedFlushThread::run() {
 
             // Finally, delete the backup copy
             settings.remove(SER_HOSTS_BACKUP);
+            settings.sync();
+            flushStatus = settings.status();
+        }
+
+        // Publish completion separately from success. Preserve each waiter's
+        // first covering result across any later flushes before it wakes up.
+        {
+            QMutexLocker locker(&m_ComputerManager->m_DelayedFlushMutex);
+            for (auto result = m_ComputerManager->m_DelayedFlushResults.begin();
+                 result != m_ComputerManager->m_DelayedFlushResults.end(); ++result) {
+                if (result.key() > m_ComputerManager->m_DelayedFlushed && result.key() <= flushGeneration) {
+                    result.value() = flushStatus;
+                }
+            }
+            if (flushStatus != QSettings::NoError) {
+                // Allow an unchanged host to queue another save after a failed
+                // write instead of treating the in-memory snapshot as persisted.
+                m_ComputerManager->m_LastSerializedHosts.clear();
+                qWarning() << "Failed to sync host settings; QSettings status:" << static_cast<int>(flushStatus);
+            }
+            if (flushGeneration > m_ComputerManager->m_DelayedFlushed) {
+                m_ComputerManager->m_DelayedFlushed = flushGeneration;
+            }
+            m_ComputerManager->m_DelayedFlushDone.wakeAll();
         }
     }
 }
@@ -323,7 +363,41 @@ void ComputerManager::saveHosts()
     // to persist our host list to disk (especially when a host has a bunch of apps).
     QMutexLocker locker(&m_DelayedFlushMutex);
     m_NeedsDelayedFlush = true;
+    m_DelayedFlushRequested++;
     m_DelayedFlushCondition.wakeOne();
+}
+
+bool ComputerManager::flushHostsNow(int timeoutMs)
+{
+    QElapsedTimer timer;
+    timer.start();
+
+    QMutexLocker locker(&m_DelayedFlushMutex);
+
+    if (m_DelayedFlushThread == nullptr || !m_DelayedFlushThread->isRunning()) {
+        return false;
+    }
+
+    // Queue a flush and remember which generation must complete. The worker
+    // snapshots m_DelayedFlushRequested after clearing the flag, so a flush
+    // that satisfies this generation is guaranteed to serialize every change
+    // made before this call (including changes that are still queued behind
+    // an already-running flush).
+    const quint64 target = ++m_DelayedFlushRequested;
+    m_DelayedFlushResults.insert(target, QSettings::NoError);
+    m_NeedsDelayedFlush = true;
+    m_DelayedFlushCondition.wakeOne();
+
+    while (m_DelayedFlushed < target) {
+        const qint64 remaining = static_cast<qint64>(timeoutMs) - timer.elapsed();
+        if (remaining <= 0) {
+            m_DelayedFlushResults.remove(target);
+            return false;
+        }
+        m_DelayedFlushDone.wait(&m_DelayedFlushMutex, static_cast<unsigned long>(remaining));
+    }
+
+    return m_DelayedFlushResults.take(target) == QSettings::NoError;
 }
 
 QHostAddress ComputerManager::getBestGlobalAddressV6(QVector<QHostAddress> &addresses)
@@ -534,6 +608,10 @@ public:
         // Finally, delete the computer itself. This must be done
         // last because the polling thread might be using it.
         delete m_Computer;
+        auto* deleted = m_Computer;
+        QMetaObject::invokeMethod(m_ComputerManager, [manager = m_ComputerManager, deleted]() {
+            manager->m_DeletingHosts.remove(deleted);
+        }, Qt::QueuedConnection);
     }
 
 private:
@@ -543,6 +621,14 @@ private:
 
 void ComputerManager::deleteHost(NvComputer* computer)
 {
+    if (m_PairingHosts.value(computer) > 0) {
+        m_DeferredPairingDeletes.insert(computer);
+        return;
+    }
+    if (m_DeletingHosts.contains(computer)) {
+        return;
+    }
+    m_DeletingHosts.insert(computer);
     // Punt to a worker thread to avoid stalling the
     // UI while waiting for the polling thread to die
     QThreadPool::globalInstance()->start(new DeferredHostDeletionTask(this, computer));
@@ -589,7 +675,7 @@ public:
           m_Pin(pin)
     {
         connect(this, &PendingPairingTask::pairingCompleted,
-                computerManager, &ComputerManager::pairingCompleted);
+                computerManager, &ComputerManager::handlePairingTaskFinished);
     }
 
 signals:
@@ -637,12 +723,50 @@ private:
     QString m_Pin;
 };
 
+void ComputerManager::handleManualHostAddCompleted(QString address, NvComputer* computer,
+                                                   bool success, bool detectedPortBlocking)
+{
+    // The worker signal carries an address and pointer, but GUI deletion can
+    // have run before this queued delivery. Validate without dereferencing it.
+    QReadLocker lock(&m_Lock);
+    if (success && (m_DeletingHosts.contains(computer) || !m_KnownHosts.values().contains(computer))) {
+        success = false;
+        computer = nullptr;
+    }
+    lock.unlock();
+    emit manualHostAddCompleted(address, computer, success, detectedPortBlocking);
+}
+
+void ComputerManager::handlePairingTaskFinished(NvComputer* computer, QString error)
+{
+    // Deliver the result while the lease still protects the pointer.
+    emit pairingCompleted(computer, error);
+    if (--m_PairingHosts[computer] == 0) {
+        m_PairingHosts.remove(computer);
+        if (m_DeferredPairingDeletes.remove(computer)) {
+            deleteHost(computer);
+        }
+    }
+}
+
 void ComputerManager::pairHost(NvComputer* computer, QString pin)
 {
+    if (!tryPairHost(computer, pin)) {
+        qWarning() << "Pairing request ignored: host is being deleted or already pairing";
+    }
+}
+
+bool ComputerManager::tryPairHost(NvComputer* computer, QString pin)
+{
+    if (m_DeletingHosts.contains(computer) || m_PairingHosts.contains(computer)) {
+        return false;
+    }
+    ++m_PairingHosts[computer];
     // Punt to a worker thread to avoid stalling the
     // UI while waiting for pairing to complete
     PendingPairingTask* pairing = new PendingPairingTask(this, computer, pin);
     QThreadPool::globalInstance()->start(pairing);
+    return true;
 }
 
 class PendingQuitTask : public QObject, public QRunnable
@@ -761,6 +885,8 @@ public:
     {
         connect(this, &PendingAddTask::computerAddCompleted,
                 computerManager, &ComputerManager::computerAddCompleted);
+        connect(this, &PendingAddTask::manualHostAddCompleted,
+                computerManager, &ComputerManager::handleManualHostAddCompleted);
         connect(this, &PendingAddTask::computerStateChanged,
                 computerManager, &ComputerManager::handleComputerStateChanged);
         connect(QCoreApplication::instance(), &QCoreApplication::aboutToQuit,
@@ -769,6 +895,7 @@ public:
 
 signals:
     void computerAddCompleted(QVariant success, QVariant detectedPortBlocking);
+    void manualHostAddCompleted(QString address, NvComputer* computer, bool success, bool detectedPortBlocking);
 
     void computerStateChanged(NvComputer* computer);
 
@@ -821,7 +948,9 @@ private:
                     portTestResult = 0;
                 }
 
-                emit computerAddCompleted(false, portTestResult != 0 && portTestResult != ML_TEST_RESULT_INCONCLUSIVE);
+                const bool blocking = portTestResult != 0 && portTestResult != ML_TEST_RESULT_INCONCLUSIVE;
+                emit manualHostAddCompleted(m_Address.address(), nullptr, false, blocking);
+                emit computerAddCompleted(false, blocking);
             }
             return QString();
         }
@@ -948,6 +1077,7 @@ private:
 
                 // For non-mDNS clients, let them know it succeeded
                 if (!m_Mdns) {
+                    emit manualHostAddCompleted(m_Address.address(), existingComputer, true, false);
                     emit computerAddCompleted(true, false);
                 }
 
@@ -982,6 +1112,7 @@ private:
 
                 // For non-mDNS clients, let them know it succeeded
                 if (!m_Mdns) {
+                    emit manualHostAddCompleted(m_Address.address(), newComputer, true, false);
                     emit computerAddCompleted(true, false);
                 }
 
@@ -1009,6 +1140,15 @@ void ComputerManager::addNewHost(NvAddress address, bool mdns, QString name, NvA
 
 QString ComputerManager::generatePinString()
 {
+    // Enterprise mode: derive the PIN from this client's certificate so an authorized
+    // Sunshine host can approve the handshake without an operator typing anything.
+    if (EnterprisePairing::enabled()) {
+        const QString derived = EnterprisePairing::derivePin();
+        if (!derived.isEmpty()) {
+            return derived;
+        }
+    }
+
     return QString::asprintf("%04u", QRandomGenerator::system()->bounded(10000));
 }
 

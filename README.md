@@ -1,3 +1,7 @@
+# moonlight-qt-Castscreen · Windows 会议室接收端
+
+使用、构建与发布请先读 [项目说明](CASTSCREEN.md)。以下保留上游介绍及致谢。
+
 # Moonlight PC
 
 [Moonlight PC](https://moonlight-stream.org) is an open source PC client for NVIDIA GameStream and [Sunshine](https://github.com/LizardByte/Sunshine).

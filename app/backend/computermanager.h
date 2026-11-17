@@ -17,6 +17,7 @@
 #include <QTimer>
 #include <QMutex>
 #include <QWaitCondition>
+#include <QSet>
 
 class ComputerManager;
 
@@ -232,6 +233,7 @@ public:
     QString generatePinString();
 
     void pairHost(NvComputer* computer, QString pin);
+    bool tryPairHost(NvComputer* computer, QString pin);
 
     void quitRunningApp(NvComputer* computer);
 
@@ -244,6 +246,14 @@ public:
 
     void clientSideAttributeUpdated(NvComputer* computer);
 
+    // Wait until every host change queued before this call has been written
+    // back to QSettings. This is needed before spawning a child process that
+    // re-reads the host registry (e.g. the streaming process), because the
+    // normal saveHosts()/saveHost() path flushes asynchronously.
+    // Returns true only if the covering flush synced with QSettings::NoError.
+    // Returns false on a QSettings error, timeout, or unavailable flush worker.
+    bool flushHostsNow(int timeoutMs = 5000);
+
 signals:
     void computerStateChanged(NvComputer* computer);
 
@@ -251,10 +261,16 @@ signals:
 
     void computerAddCompleted(QVariant success, QVariant detectedPortBlocking);
 
+    // Correlate standby requests with the actual HTTP-resolved host, not an
+    // unrelated GUI add or a stale record sharing the same address.
+    void manualHostAddCompleted(QString address, NvComputer* computer, bool success, bool detectedPortBlocking);
+
     void quitAppCompleted(QVariant error);
 
 private slots:
     void handleAboutToQuit();
+    void handlePairingTaskFinished(NvComputer* computer, QString error);
+    void handleManualHostAddCompleted(QString address, NvComputer* computer, bool success, bool detectedPortBlocking);
 
     void handleComputerStateChanged(NvComputer* computer);
 
@@ -273,6 +289,11 @@ private:
     int m_PollingRef;
     QReadWriteLock m_Lock;
     QMap<QString, NvComputer*> m_KnownHosts;
+    // Main-thread task leases keep GUI deletion from freeing a pairing worker's
+    // raw host pointer before its queued completion has been consumed.
+    QHash<NvComputer*, int> m_PairingHosts;
+    QSet<NvComputer*> m_DeferredPairingDeletes;
+    QSet<NvComputer*> m_DeletingHosts;
     QMap<QString, ComputerPollingEntry*> m_PollEntries;
     QHash<QString, NvComputer> m_LastSerializedHosts; // Protected by m_DelayedFlushMutex
     QSharedPointer<QMdnsEngine::Server> m_MdnsServer;
@@ -282,5 +303,12 @@ private:
     DelayedFlushThread* m_DelayedFlushThread;
     QMutex m_DelayedFlushMutex; // Lock ordering: Must never be acquired while holding NvComputer lock
     QWaitCondition m_DelayedFlushCondition;
+    QWaitCondition m_DelayedFlushDone;
     bool m_NeedsDelayedFlush;
+    // Generation counters and active waiters' results, protected by m_DelayedFlushMutex.
+    // Completion includes failed syncs; each waiter retains the first covering
+    // flush's status even if another flush completes before it resumes.
+    quint64 m_DelayedFlushRequested;
+    quint64 m_DelayedFlushed;
+    QMap<quint64, QSettings::Status> m_DelayedFlushResults;
 };

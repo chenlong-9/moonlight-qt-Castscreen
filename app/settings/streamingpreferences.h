@@ -156,6 +156,7 @@ public:
     Q_PROPERTY(bool swapFaceButtons MEMBER swapFaceButtons NOTIFY swapFaceButtonsChanged)
     Q_PROPERTY(bool keepAwake MEMBER keepAwake NOTIFY keepAwakeChanged)
     Q_PROPERTY(CaptureSysKeysMode captureSysKeysMode MEMBER captureSysKeysMode NOTIFY captureSysKeysModeChanged)
+    Q_PROPERTY(bool enterprisePinlessPairing MEMBER enterprisePinlessPairing NOTIFY enterprisePinlessPairingChanged)
     Q_PROPERTY(Language language MEMBER language NOTIFY languageChanged);
 
     Q_INVOKABLE bool retranslate();
@@ -201,6 +202,11 @@ public:
     CaptureSysKeysMode captureSysKeysMode;
     RendererSelection rendererSelection;
 
+    // Enterprise pinless pairing: when enabled, this Moonlight build derives the pairing
+    // PIN from its own certificate so an authorized Sunshine host can approve the
+    // handshake without an operator typing a PIN. Disable it to pair with stock hosts.
+    bool enterprisePinlessPairing;
+
 signals:
     void displayModeChanged();
     void bitrateChanged();
@@ -238,6 +244,7 @@ signals:
     void keepAwakeChanged();
     void languageChanged();
     void rendererSelectionChanged();
+    void enterprisePinlessPairingChanged();
 
 private:
     explicit StreamingPreferences(QQmlEngine *qmlEngine);
